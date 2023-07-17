@@ -1,0 +1,840 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <title>three.js webgl2 - volume - cloud</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+    <link type="text/css" rel="stylesheet" href="main.css">
+</head>
+
+<body>
+    <div id="info">
+        <a href="https://threejs.org" target="_blank" rel="noopener">three.js</a> webgl2 - volume - cloud
+    </div>
+
+    <!-- Import maps polyfill -->
+    <!-- Remove this when import maps will be widely supported -->
+    <script async src="https://unpkg.com/es-module-shims@1.3.6/dist/es-module-shims.js"></script>
+
+    <script type="importmap">
+			{
+				"imports": {
+					"three": "../build/three.module.js",
+					"three/addons/": "./jsm/"
+				}
+			}
+		</script>
+
+    <script type="module">
+
+
+
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { ImprovedNoise } from 'three/addons/math/ImprovedNoise.js';
+        import { Water } from 'three/addons/objects/Water.js';
+        import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+        import WebGL from 'three/addons/capabilities/WebGL.js';
+        import { Sky } from 'three/addons/objects/Sky.js';
+        if (WebGL.isWebGL2Available() === false) {
+
+            document.body.appendChild(WebGL.getWebGL2ErrorMessage());
+
+        }
+
+
+        const shaderList = [`
+precision mediump float;
+
+varying vec2 vUv;
+attribute vec3 dir;
+varying vec3 vdir;
+
+void main() {
+    vUv = uv;
+    vdir = dir;
+    gl_Position = vec4(position, 1.);
+}`, `
+precision highp float;
+precision highp sampler3D;
+#include <packing>
+
+uniform sampler3D perlinWorley;
+uniform sampler3D detail_texture;
+uniform sampler2D tt;
+uniform sampler2D Cloud2DTex;
+uniform sampler2D maskNoise;
+uniform sampler2D depthTexture;
+uniform sampler2D blueNoise;
+uniform vec4 _BlueNoiseCoords;
+uniform vec2 size;
+varying vec2 vUv;
+varying vec3 vdir;
+uniform vec3 cp;
+uniform vec3 lightPos;
+uniform int frame;
+uniform mat4 projection;
+uniform mat4 view;
+uniform float near;
+uniform float far;
+uniform float time;
+
+uniform float w_c0;
+uniform float w_c1;
+uniform float w_h;
+uniform float g_d;
+uniform float g_c;
+
+uniform float base_g;
+uniform float base_b;
+uniform float base_a;
+uniform float detail_r;
+uniform float detail_g;
+uniform float detail_b;
+
+uniform float _rayOffsetStrength;
+uniform vec3 boundsMin;
+uniform vec3 boundsMax;
+uniform vec4 xy_Speed_zw_Warp;
+uniform float shapeTiling;
+uniform float detailTiling;
+uniform float heightWeights;
+
+uniform float densityOffset;
+
+#define baseBright  vec3(1.26,1.25,1.29)   
+#define baseDark    vec3(0.31,0.31,0.32)   
+#define lightBright vec3(1.29, 1.17, 1.05) 
+#define lightDark   vec3(0.7,0.75,0.8)     
+
+
+float l = exp(3.2) * 0.033333;
+
+int marchNumber = 512;
+vec2 weather_uv;
+
+#define PI radians(180.)
+
+#define SphereRadius 1200.
+
+#define BoundingBoxMode SphereBounding 
+
+
+vec2 RaySphereDst(vec3 sphereCenter, float sphereRadius, vec3 pos, vec3 rayDir) {
+    vec3 oc = pos - sphereCenter;
+    float b = dot(rayDir, oc);
+    float c = dot(oc, oc) - sphereRadius * sphereRadius;
+    float t = b * b - c;
+
+    float delta = sqrt(max(t, 0.));
+    float dstToSphere = max(-b - delta, 0.);
+    float dstInSphere = max(-b + delta - dstToSphere, 0.);
+    return vec2(dstToSphere, dstInSphere);
+}
+
+vec2 RayCloudLayerDst(vec3 sphereCenter, float earthRadius, float heightMin, float heightMax, vec3 pos, vec3 rayDir, bool isShape) {
+
+    vec2 cloudDstMin = RaySphereDst(sphereCenter, heightMin + earthRadius, pos, rayDir);
+    vec2 cloudDstMax = RaySphereDst(sphereCenter, heightMax + earthRadius, pos, rayDir);
+
+    float dstToCloudLayer = 0.;
+
+    float dstInCloudLayer = 0.;
+
+
+    if(isShape) {
+
+        if(pos.y <= heightMin) {
+            vec3 startPos = pos + rayDir * cloudDstMin.y;
+
+            if(startPos.y >= 0.) {
+                dstToCloudLayer = cloudDstMin.y;
+                dstInCloudLayer = cloudDstMax.y - cloudDstMin.y;
+            }
+            return vec2(dstToCloudLayer, dstInCloudLayer);
+        }
+
+        if(pos.y > heightMin && pos.y <= heightMax) {
+            dstToCloudLayer = 0.;
+            dstInCloudLayer = cloudDstMin.y > 0. ? cloudDstMin.x : cloudDstMax.y;
+            return vec2(dstToCloudLayer, dstInCloudLayer);
+        }
+
+
+        dstToCloudLayer = cloudDstMax.x;
+        dstInCloudLayer = cloudDstMin.y > 0. ? cloudDstMin.x - dstToCloudLayer : cloudDstMax.y;
+    } else
+    {
+        dstToCloudLayer = 0.;
+        dstInCloudLayer = cloudDstMin.y > 0. ? cloudDstMin.x : cloudDstMax.y;
+    }
+
+    return vec2(dstToCloudLayer, dstInCloudLayer);
+}
+
+vec2 RayBoxDst(vec3 boxMin, vec3 boxMax, vec3 pos, vec3 rayDir) {
+    vec3 t0 = (boxMin - pos) / rayDir;
+    vec3 t1 = (boxMax - pos) / rayDir;
+
+    vec3 tmin = min(t0, t1);
+    vec3 tmax = max(t0, t1);
+
+
+    float dstA = max(max(tmin.x, tmin.y), tmin.z);
+    float dstB = min(min(tmax.x, tmax.y), tmax.z);
+
+    float dstToBox = max(0., dstA);
+    float dstInBox = max(0., dstB - dstToBox);
+
+    return vec2(dstToBox, dstInBox);
+}
+
+float remap(float original_value, float original_min, float original_max, float new_min, float new_max) {
+    return new_min + (((original_value - original_min) / (original_max - original_min)) * (new_max - new_min));
+}
+
+
+float R(float v, float lo, float ho, float ln, float hn) {
+    return ln + (v - lo) * (hn - ln) / (ho - lo);
+}
+
+float SAT(float v) {
+    return clamp(v, 0.0, 1.0);
+}
+
+float Li(float v0, float v1, float ival) {
+    return (1.0 - ival) * v0 + ival * v1;
+}
+
+float lerpF(float a, float b, float t) {
+
+    return a * (1. - t) + b * t;
+}
+
+vec2 worldVertex2UV(vec3 world_vertex) {
+    return vec2((atan(world_vertex.z / world_vertex.x) + PI) / (2. * PI), asin(world_vertex.y / SphereRadius) / PI + 0.5);
+}
+
+float getDensity(vec3 currentPos) {
+
+
+    float speedShape = time / 1000. * xy_Speed_zw_Warp.x;
+    float speedDetail = time / 1000. * xy_Speed_zw_Warp.y;
+
+    vec3 uvwShape = currentPos.xzy * shapeTiling + vec3(speedShape, speedShape * 0.2, 0.);
+    vec3 uvwDetail = currentPos.xzy * detailTiling + vec3(speedDetail, speedDetail * 0.2, 0.);
+
+    vec3 boundsCenter = (boundsMax + boundsMin) * 0.5;
+    vec3 size = boundsMax - boundsMin;
+    vec2 uv = (size.xz * 0.5 + (currentPos.xz - boundsCenter.xz)) / max(size.x, size.z);
+
+
+    vec4 w_d;
+    float p_h;
+
+        w_d = texture2D(Cloud2DTex, uv + vec2(speedShape * 0.4, 0));
+        p_h = SAT((currentPos.y - boundsMin.y) / (boundsMax.y - boundsMin.y));
+
+
+
+
+
+
+
+    float DRb = p_h * SAT(remap(p_h, 0.0, 0.25, 0.0, 1.0));
+    float DRt = SAT(remap(p_h, 0.75, 1.0, 1.0, 0.1));
+
+    float DA;
+
+        DA = g_d * DRb * DRt * w_d.r * 2.0;
+
+
+
+
+    if(DA == 0.)
+        return 0.;
+
+
+    float WMc = max(w_c0, SAT(g_c - 0.5) * w_c1 * 2.0);
+
+    float SRb = SAT(remap(p_h, 0.0, 0.07, 0.0, 1.0));
+    float SRt = SAT(remap(p_h, w_h * 0.2, w_h, 1.0, 0.1));
+    float SA = SRb * SRt;
+
+    vec4 maskNoise = texture2D(maskNoise, uv + vec2(speedShape * 0.5, 0.));
+    vec4 sn = texture(perlinWorley, uvwShape + maskNoise.r * xy_Speed_zw_Warp.z * 0.1);
+
+    const float containerEdgeFadeDst = 100.;
+    float dstFromEdgeX = min(containerEdgeFadeDst, min(currentPos.x - boundsMin.x, boundsMax.x - currentPos.x));
+    float dstFromEdgeZ = min(containerEdgeFadeDst, min(currentPos.z - boundsMin.z, boundsMax.z - currentPos.z));
+    float edgeWeight = min(dstFromEdgeZ, dstFromEdgeX) / containerEdgeFadeDst;
+
+    float gMin = remap(w_d.r, 0., 1., 0.1, 0.6);
+    float gMax = remap(w_d.r, 0., 1., gMin, 0.9);
+    float heightPercent;
+
+    heightPercent = (currentPos.y - boundsMin.y) / size.y;
+
+
+
+
+
+
+    float heightGradient = SAT(remap(heightPercent, 0.0, gMin, 0., 1.)) * SAT(remap(heightPercent, 1., gMax, 0., 1.));
+    float heightGradient2 = SAT(remap(heightPercent, 0.0, w_d.r, 1., 0.)) * SAT(remap(heightPercent, 0.0, gMin, 0., 1.));
+    heightGradient = SAT(lerpF(heightGradient, heightGradient2, heightWeights));
+
+    heightGradient *= edgeWeight;
+
+
+    float SNsample = remap(sn.r, dot(sn.gba, (vec3(base_g, base_b, base_a))) - 1., 1.0, 0.0, 1.) * heightGradient;
+    SNsample += densityOffset * 0.005;
+    if(SNsample <= 0.)
+        return 0.;
+
+
+    float DNfbm = dot(texture(detail_texture, uvwDetail + sn.r * xy_Speed_zw_Warp.w * 0.1).rgb, (vec3(detail_r, detail_g, detail_b)));
+    float DNmod = 0.35 * exp(-g_c * 0.75) * Li(DNfbm, 1.0 - DNfbm, SAT(p_h * 5.0));
+    float SNnd = SAT(remap(SNsample * SA, 1.0 - g_c * WMc, 1., 0., 1.));
+    float d = pow(SAT(remap(SNnd, DNmod, 1.0, 0.0, 1.0)) * DA, .2222);
+
+    float density = d;
+    return density;
+}
+
+
+float linearizeDepth(float depth) {
+    return (2.0 * near) / (far + near - depth * (far - near));
+}
+
+vec3 lerpV3(vec3 a, vec3 b, float t) {
+    return a * (1. - t) + b * t;
+}
+
+
+float hg(float a, float g) {
+    float g2 = g * g;
+    return (1. - g2) / (4. * 3.1415 * pow(1. + g2 - 2. * g * (a), 1.5));
+}
+
+#define _lightAbsorptionTowardSun 0.16
+#define _LightColor0 vec4(0.,0.,0.,0.)
+#define _darknessThreshold 0.0
+#define _colA vec4(1.,0.351,0.,1.)
+#define _colB vec4(0.376,0.473,0.557,1.)
+#define _colorOffset1 0.86
+#define _colorOffset2 0.82
+#define _phaseParams vec4(0.78,0.25,0.29,0.6)
+#define _lightAbsorptionThroughCloud 0.3
+
+float phase(float a) {
+    float blend = .5;
+    float hgBlend = hg(a, _phaseParams.x) * (1. - blend) + hg(a, -_phaseParams.y) * blend;
+    return _phaseParams.z + hgBlend * _phaseParams.w;
+}
+
+vec3 lightmarch(vec3 position, float dstTravelled) {
+
+    vec3 dirToLight = normalize(lightPos - position);
+    float dstInsideBox;
+
+        dstInsideBox = RayBoxDst(boundsMin, boundsMax, position, dirToLight).y;
+
+
+    float stepSize = dstInsideBox / 1.;
+    float totalDensity = 0.;
+
+    for(int step = 0; step < 1; step++) { 
+        position += dirToLight * stepSize; 
+        totalDensity += max(0., getDensity(position));
+
+    }
+    float transmittance = exp(-totalDensity * _lightAbsorptionTowardSun);
+
+
+    vec3 cloudColor = lerpV3(_colA.rgb, _LightColor0.rgb, SAT(transmittance * _colorOffset1));
+    cloudColor = lerpV3(_colB.rgb, cloudColor, SAT(pow(transmittance * _colorOffset2, 3.)));
+
+    return _darknessThreshold + transmittance * (1. - _darknessThreshold) * cloudColor;
+}
+
+vec4 getCloud() {
+    vec3 direction = normalize(vdir);
+
+   
+
+    vec2 rayBoxDst = RayBoxDst(boundsMin, boundsMax, cp, direction);
+
+
+
+    vec3 startPos = cp + direction * rayBoxDst.x;
+
+
+
+    vec2 texcoord = gl_FragCoord.xy / size;
+    float blueNoise = texture2D(blueNoise, texcoord * _BlueNoiseCoords.xy + _BlueNoiseCoords.zw).r;
+    float marchingLength = blueNoise * _rayOffsetStrength;
+
+    float totalDensity = 0.;
+    vec4 colorSum = vec4(0.);
+    vec3 lightEnergy = vec3(0.);
+    float sumDensity = 1.;
+
+    for(int march = 0; march <= marchNumber; march++) {
+
+        if(marchingLength > rayBoxDst.y)
+            break;
+
+        float current_length = l;
+
+        vec3 currentPos = startPos + direction * marchingLength;
+
+        vec4 screenPos = projection * view * vec4(currentPos, 1.0);
+        screenPos /= screenPos.w;
+  
+        screenPos.xyz = vec3(screenPos.xy * 0.5 + 0.5, screenPos.z);
+
+        float sampleDepth = texture2D(depthTexture, screenPos.xy).r;
+        float testDepth = screenPos.z;  
+
+        sampleDepth = linearizeDepth(sampleDepth);
+        testDepth = linearizeDepth(testDepth);
+
+        if(sampleDepth < testDepth) {
+            return vec4(0.);
+        }
+
+        float density = getDensity(currentPos);
+
+        if(density > 0.) {
+            float cosAngle = dot(normalize(vdir), normalize(lightPos - currentPos));
+            vec3 phaseVal = vec3(phase(cosAngle));
+            vec3 lightTransmittance = lightmarch(currentPos, marchingLength);
+            lightEnergy += density * l * sumDensity * lightTransmittance * phaseVal;
+            sumDensity *= exp(-density * l * _lightAbsorptionThroughCloud);
+
+            if(sumDensity < 0.01)
+                break;
+        }
+
+        marchingLength += current_length;
+        marchingLength += float(march) * 0.01;
+
+        colorSum += density * l;
+    }
+    if(sumDensity == 1.)
+        return vec4(0.);
+    else
+        return vec4(lightEnergy, 1. - sumDensity);
+}
+
+void main() {
+    gl_FragColor = getCloud();
+
+}
+`];
+
+        let orc = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1); // 创建正交相机
+
+
+        let renderer = new THREE.WebGLRenderer();
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        let scene1 = new THREE.Scene()
+        let sun = new THREE.Vector3()
+        const phi = THREE.MathUtils.degToRad(90 - 10);
+        const theta = THREE.MathUtils.degToRad(180);
+        sun.setFromSphericalCoords(1, phi, theta);
+        scene1.add(new THREE.GridHelper(50, 50))
+
+        let scene2 = new THREE.Scene()
+        let klTarget = new THREE.WebGLRenderTarget(renderer.domElement.width / 4, renderer.domElement.height / 4)
+        let WrTarget = new THREE.WebGLRenderTarget(renderer.domElement.width, renderer.domElement.height)
+        WrTarget.depthTexture = new THREE.DepthTexture(renderer.domElement.width, renderer.domElement.height);
+
+
+        let scene3 = new THREE.Scene()
+
+        let percamera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 1, 1e8);
+        percamera.position.set(30, 30, 100);
+        let orbit = new OrbitControls(percamera, renderer.domElement);
+        orbit.target.set(35, 15, 0);
+
+        let boxGeo = new THREE.BoxGeometry(5, 5, 5)
+        let bmaterial = new THREE.MeshBasicMaterial({
+            color: 0xFF0000
+        })
+        let box = new THREE.Mesh(boxGeo, bmaterial);
+
+        scene1.add(box);
+
+        var textureLoader = new THREE.TextureLoader();
+        var fileLoader = new THREE.FileLoader();
+        fileLoader.setResponseType("arraybuffer");
+
+
+        let promiseList = []
+        let detail_map, detail_map_high;
+
+        promiseList.push(new Promise((resolve) => {
+            fileLoader.load(
+                "textures/体积云demo/texture.bin",
+                function (buf) {
+                    var data = new Float32Array(buf);
+                    detail_map = new THREE.Data3DTexture(data, 64, 64, 64);
+                    detail_map.needsUpdate = true
+                    detail_map.type = 1015;
+                    detail_map.format = 1023;
+                    detail_map.wrapR = detail_map.wrapS = detail_map.wrapT = THREE.RepeatWrapping;
+                    detail_map.minFilter = detail_map.magFilter = 1006;
+                    resolve()
+                }, null,
+                function (err) {
+                    console.error("detail_noise cannot be loaded: " + err);
+                }
+            );
+        }))
+
+
+
+        promiseList.push(new Promise((resolve) => {
+            fileLoader.load(
+                "textures/体积云demo/detail_texture.bin",
+                function (buf) {
+                    var data = new Float32Array(buf);
+                    detail_map_high = new THREE.Data3DTexture(data, 32, 32, 32);
+                    detail_map_high.needsUpdate = true
+                    detail_map_high.type = 1015;
+                    detail_map_high.format = 1023;
+                    detail_map_high.wrapR = detail_map_high.wrapS = detail_map_high.wrapT = THREE.RepeatWrapping;
+                    detail_map_high.minFilter = detail_map_high.magFilter = 1006;
+                    resolve()
+                }, null,
+                function (err) {
+                    console.error("detail_noise_high cannot be loaded: " + err);
+                }
+            );
+        }))
+
+
+        let blueNoise
+        promiseList.push(new Promise((resolve) => {
+            blueNoise = textureLoader.load("textures/体积云demo/blue_noise.png", () => {
+                blueNoise.needsUpdate = true
+                resolve()
+            });
+        }))
+        let cloud2dTexture
+        promiseList.push(new Promise((resolve) => {
+            cloud2dTexture = textureLoader.load("textures/体积云demo/鹅卵图.png", () => {
+                cloud2dTexture.needsUpdate = true
+                resolve()
+            });
+        }))
+
+        let water;
+        Promise.all(promiseList).then((resList) => {
+
+            init();
+
+
+            function createCloud (vertexShader, fragmentShader) {
+
+
+                let geometry = new THREE.BufferGeometry()
+                let position = new Float32Array([-1, -1, -1, 1, -1, -1, 1, 1, -1, 1, 1, -1, -1, 1, -1, -1, -1, -1])
+                let uv = new Uint8Array([0, 0, 1, 0, 1, 1, 1, 1, 0, 1, 0, 0]);
+
+
+                blueNoise.wrapS = 1000;
+                blueNoise.wrapT = 1000;
+
+
+                cloud2dTexture.wrapS = 1000;
+                cloud2dTexture.wrapT = 1000;
+
+                geometry.setAttribute("position", new THREE.BufferAttribute(position, 3));
+                geometry.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+
+
+                const material = new THREE.ShaderMaterial({
+                    transparent: true,
+                    uniforms: {
+                        boundsMin: {
+                            value: new THREE.Vector3(-4000., 320., -4000.)
+                        },
+                        boundsMax: {
+                            value: new THREE.Vector3(4000., 400., 4000.)
+                        },
+                        depthTexture: {
+                            value: WrTarget.depthTexture
+                        },
+                        Cloud2DTex: {
+                            value: cloud2dTexture
+                        },
+                        blueNoise: {
+                            value: blueNoise
+                        },
+                        maskNoise: {
+                            value: geometry
+                        },
+                        size: {
+                            value: [renderer.domElement.width, renderer.domElement.height]
+                        },
+                        cp: {
+                            value: percamera.getWorldPosition(new THREE.Vector3())
+                        },
+                        lightPos: {
+                            value: sun
+                        },
+                        frame: {
+                            value: 0
+                        },
+                        projection: {
+                            value: percamera.projectionMatrix
+                        },
+                        view: {
+                            value: percamera.matrixWorldInverse
+                        },
+                        near: {
+                            value: percamera.near
+                        },
+                        far: {
+                            value: percamera.far
+                        },
+                        perlinWorley: {
+                            value: detail_map
+                        },
+                        time: {
+                            value: 0
+                        },
+                        detail_texture: {
+                            value: detail_map_high
+                        },
+                        _BlueNoiseCoords: {
+                            value: [renderer.domElement.width / 512, renderer.domElement.height / 512, 0, 0]
+                        },
+                        _rayOffsetStrength: {
+                            value: 1
+                        },
+                        w_c0: {
+                            value: .0
+                        },
+                        w_c1: {
+                            value: 1
+                        },
+                        w_h: {
+                            value: 10
+                        },
+                        g_d: {
+                            value: 1
+                        },
+                        g_c: {
+                            value: .9
+                        },
+                        detail_r: {
+                            value: .63
+                        },
+                        detail_g: {
+                            value: .43
+                        },
+                        detail_b: {
+                            value: .45
+                        },
+                        base_g: {
+                            value: .82
+                        },
+                        base_b: {
+                            value: .78
+                        },
+                        base_a: {
+                            value: .78
+                        },
+                        xy_Speed_zw_Warp: {
+                            value: [0.03, 0.03, 1, 1]
+                        },
+                        shapeTiling: {
+                            value: .002
+                        },
+                        detailTiling: {
+                            value: .022
+                        },
+                        densityOffset: {
+                            value: 0
+                        },
+                        heightWeights: {
+                            value: 0.7
+                        },
+
+                    },
+                    vertexShader,
+                    fragmentShader
+                })
+
+                let cloudMesh = new THREE.Mesh(geometry, material);
+                scene2.add(cloudMesh)
+                return cloudMesh
+            }
+
+            function createdPick () {
+                const geometry = new THREE.BufferGeometry()
+                    , position = new Float32Array([-1, -1, -1, 1, -1, -1, 1, 1, -1, 1, 1, -1, -1, 1, -1, -1, -1, -1])
+                    , uv = new Uint8Array([0, 0, 1, 0, 1, 1, 1, 1, 0, 1, 0, 0]);
+                geometry.setAttribute("position", new THREE.BufferAttribute(position, 3));
+                geometry.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+                const material = new THREE.ShaderMaterial({
+                    transparent: true,
+                    uniforms: {
+                        sceneTexture: {
+                            value: WrTarget.texture
+                        },
+                        cloudTexture: {
+                            value: klTarget.texture
+                        }
+                    },
+                    vertexShader: `
+			precision mediump float;
+			varying vec2 vUv;
+			
+			void main() {
+				vUv = uv;
+				gl_Position = vec4(position,1.);
+			}
+		`,
+                    fragmentShader: `
+
+			#include <packing>
+
+			uniform sampler2D tt;
+			uniform sampler2D Cloud2DTex;
+			uniform sampler2D depthTexture;
+			uniform vec2 size;
+			varying vec2 vUv;
+			varying vec3 vdir;
+			uniform vec3 cp;
+			uniform vec3 lightPos;
+			uniform int frame;
+			uniform mat4 projection;
+			uniform mat4 view;
+			uniform float near;
+			uniform float far;
+			uniform sampler2D sceneTexture;
+			uniform sampler2D cloudTexture;
+
+
+			void main() {
+				vec4 sceneColor = texture2D(sceneTexture,vUv);
+				vec4 cloudColor = texture2D(cloudTexture,vUv);
+				gl_FragColor.rgb = sceneColor.rgb * cloudColor.a +  cloudColor.rgb;
+				gl_FragColor.a = 1.;
+			}
+			`
+                })
+                let mesh = new THREE.Mesh(geometry, material);
+                return scene3.add(mesh)
+                return mesh
+            }
+
+            function init () {
+
+                const waterGeometry = new THREE.PlaneGeometry(10000, 10000);
+
+                water = new Water(
+                    waterGeometry,
+                    {
+                        textureWidth: 512,
+                        textureHeight: 512,
+                        waterNormals: new THREE.TextureLoader().load('textures/waternormals.jpg', function (texture) {
+
+                            texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+
+                        }),
+                        sunDirection: sun,
+                        sunColor: 0xffffff,
+                        waterColor: 0x001e0f,
+                        distortionScale: 3.7,
+                        fog: scene1.fog !== undefined
+                    }
+                );
+
+                water.rotation.x = - Math.PI / 2;
+
+                scene1.add(water);
+                // Sky
+                const sky = new Sky();
+                sky.scale.setScalar(10000);
+                scene1.add(sky);
+
+                const skyUniforms = sky.material.uniforms;
+
+                skyUniforms['turbidity'].value = 0.00001;
+                skyUniforms['rayleigh'].value = 0.5;
+                skyUniforms['mieCoefficient'].value = 0.005;
+                skyUniforms['mieDirectionalG'].value = 0.8;
+
+                sky.material.uniforms['sunPosition'].value.copy(sun);
+
+
+            }
+
+            function getDirection () {
+                let direction = [new THREE.Vector3(-1, -1, -1), new THREE.Vector3(1, -1, -1), new THREE.Vector3(1, 1, -1), new THREE.Vector3(-1, 1, -1)];
+                for (let e = 0; e < direction.length; e++) {
+                    direction[e].applyMatrix4(percamera.projectionMatrixInverse)
+                    direction[e].applyMatrix4(percamera.matrixWorld)
+                    direction[e].sub(percamera.getWorldPosition(new THREE.Vector3()));
+                }
+
+                return direction
+            }
+
+            let cloudMesh = createCloud(shaderList[0], shaderList[1]);
+            createdPick();
+
+
+
+
+            let frame = 0
+
+
+
+
+            function animation (delta) {
+                requestAnimationFrame(animation)
+                frame++;
+                // orbit.update(),
+                percamera.updateMatrixWorld();
+                percamera.updateProjectionMatrix();
+                const e = getDirection()
+                let dir = new Float32Array([...e[0].toArray(), ...e[1].toArray(), ...e[2].toArray(), ...e[2].toArray(), ...e[3].toArray(), ...e[0].toArray()]);
+                cloudMesh.geometry.setAttribute("dir", new THREE.BufferAttribute(dir, 3))
+                cloudMesh.material.uniforms.cp.value = percamera.getWorldPosition(new THREE.Vector3())
+                cloudMesh.material.uniforms.frame.value = frame;
+                cloudMesh.material.uniforms.projection.value = percamera.projectionMatrix;
+                cloudMesh.material.uniforms.view.value = percamera.matrixWorldInverse;
+                cloudMesh.material.uniforms.time.value = delta;
+                cloudMesh.material.needsUpdate = true
+                water.material.uniforms['time'].value += 1.0 / 60.0;
+
+                renderer.setRenderTarget(WrTarget);
+                renderer.render(scene1, percamera);
+                renderer.setRenderTarget(klTarget);
+                renderer.render(scene2, orc);
+                renderer.setRenderTarget(null);
+                renderer.render(scene3, orc);
+
+            }
+            animation();
+
+        })
+
+
+
+    </script>
+
+</body>
+
+</html>
